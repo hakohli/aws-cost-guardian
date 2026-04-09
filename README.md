@@ -1,60 +1,80 @@
 # AWS Cost Guardian
 
-Automated monitoring for AWS Savings Plans, Reserved Instances, and cost optimization recommendations. Deploys as a single CloudFormation stack — one Lambda, one daily trigger, one SNS topic.
+Automated monitoring for AWS Savings Plans and Reserved Instances — expiration alerts, missing coverage detection, and purchase recommendations delivered as styled HTML emails.
+
+**Deploy to the payer (management) account** for org-wide visibility across all linked accounts.
 
 ## What It Does
 
-- **Expiration Alerts**: Notifies you 30 days before any SP or RI expires (EC2, RDS, OpenSearch, ElastiCache, Redshift)
-- **Missing Coverage Alerts**: Detects if you have On-Demand spend with no SP/RI coverage and includes purchase recommendations
-- **Daily Summary**: Runs every morning at 9 AM UTC with a consolidated report
+| Check | Alert When |
+|---|---|
+| SP Expiration | Savings Plan expires within N days |
+| RI Expiration | Any RI (EC2, RDS, OpenSearch, ElastiCache, Redshift) expires within N days |
+| Missing Coverage | On-Demand spend exceeds threshold with no active SP/RI |
+| Recommendations | Includes AWS purchase recommendations with estimated savings |
 
 ## Architecture
 
 ```
-EventBridge (daily cron 9AM UTC)
+EventBridge (configurable cron)
        │
        ▼
 Lambda (cost-guardian)
        │
-       ├── Check Savings Plans expiry
-       ├── Check EC2/RDS/OpenSearch/ElastiCache/Redshift RIs
-       ├── Check for missing SP/RI coverage
-       ├── Pull AWS recommendations
+       ├── Savings Plans API
+       ├── EC2/RDS/OpenSearch/ElastiCache/Redshift RI APIs
+       ├── Cost Explorer (On-Demand spend + recommendations)
        │
        ▼
-  SNS → Email / Slack / PagerDuty
+SES → Styled HTML email with tables
 ```
 
 ## Deploy
 
 ```bash
-aws cloudformation deploy \
-  --template-file template.yaml \
-  --stack-name aws-cost-guardian \
-  --parameter-overrides AlertEmail=you@example.com AlertDays=30 \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --region us-east-1
-```
+# Basic — defaults to 30 days, $100 threshold, 9AM UTC daily
+./deploy.sh --email team@company.com
 
-**Confirm the SNS subscription email** after deployment.
+# Custom thresholds
+./deploy.sh --email team@company.com --days 60 --threshold 500
+
+# Different region
+./deploy.sh --email team@company.com --region us-west-2
+
+# Weekdays only at 2PM UTC
+./deploy.sh --email team@company.com --schedule "cron(0 14 ? * MON-FRI *)"
+
+# Tear down
+./deploy.sh --teardown --region us-east-1
+```
 
 ## Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `AlertEmail` | (required) | Email for alerts |
-| `AlertDays` | `30` | Days before expiry to start alerting |
-| `OnDemandThreshold` | `100` | Monthly On-Demand spend ($) that triggers "no SP/RI" alert |
+| `--email` | (required) | Recipient email |
+| `--sender` | same as email | SES verified sender |
+| `--days` | `30` | Days before expiry to alert |
+| `--threshold` | `100` | On-Demand monthly $ threshold |
+| `--schedule` | `cron(0 9 * * ? *)` | EventBridge schedule (UTC) |
+| `--region` | `us-east-1` | AWS region |
+| `--disable` | | Deploy with schedule off |
+
+## Why Payer Account?
+
+- Cost Explorer APIs return org-wide data only from the management account
+- Savings Plans are purchased at the payer level
+- RIs purchased with org sharing are visible from the payer
+- Linked accounts only see their own RIs
+
+## Prerequisites
+
+- SES verified sender email (or SES out of sandbox for production)
+- IAM permissions to deploy CloudFormation with IAM resources
 
 ## Cost
 
-~$0.01/month (1 Lambda invocation per day, SNS email delivery).
-
-## Tear Down
-
-```bash
-aws cloudformation delete-stack --stack-name aws-cost-guardian --region us-east-1
-```
+~$0.01/month — 1 Lambda invocation/day + SES email.
 
 ## License
 
