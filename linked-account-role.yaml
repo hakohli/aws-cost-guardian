@@ -1,0 +1,43 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cost Guardian linked account role. Deploy via StackSet to all linked accounts
+  to enable cross-account RI scanning from the payer account.
+
+Parameters:
+  PayerAccountId:
+    Type: String
+    Description: Payer (management) account ID that will assume this role
+    AllowedPattern: ^[0-9]{12}$
+
+Resources:
+  CostGuardianLinkedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cost-guardian-linked-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${PayerAccountId}:role/cost-guardian-role-${AWS::Region}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: CostGuardian
+      Policies:
+        - PolicyName: ReadOnlyRI
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeReservedInstances
+                  - rds:DescribeReservedDBInstances
+                  - es:DescribeReservedInstances
+                  - elasticache:DescribeReservedCacheNodes
+                  - redshift:DescribeReservedNodes
+                Resource: '*'
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt CostGuardianLinkedRole.Arn

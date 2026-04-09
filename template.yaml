@@ -1,60 +1,35 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  AWS Cost Guardian — SP/RI expiration alerts, missing coverage detection,
-  and purchase recommendations. Deploy to payer (management) account for
-  org-wide visibility.
-
-Metadata:
-  AWS::CloudFormation::Interface:
-    ParameterGroups:
-      - Label: {default: Notification Settings}
-        Parameters: [AlertEmail, SenderEmail]
-      - Label: {default: Alert Thresholds}
-        Parameters: [AlertDays, OnDemandThreshold]
-      - Label: {default: Schedule}
-        Parameters: [ScheduleExpression, Enabled]
-    ParameterLabels:
-      AlertEmail: {default: Recipient email address}
-      SenderEmail: {default: SES verified sender email}
-      AlertDays: {default: Days before expiry to alert}
-      OnDemandThreshold: {default: On-Demand monthly spend alert threshold ($)}
-      ScheduleExpression: {default: Cron schedule (UTC)}
-      Enabled: {default: Enable daily schedule}
+  AWS Cost Guardian — Cross-account SP/RI monitoring with email alerts
+  and interactive Bedrock agent. Deploy to payer account.
 
 Parameters:
   AlertEmail:
     Type: String
-    Description: Email address to receive cost alerts
     AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
   SenderEmail:
     Type: String
-    Description: SES verified sender email (can be same as AlertEmail)
     AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
   AlertDays:
     Type: Number
     Default: 30
-    MinValue: 1
-    MaxValue: 365
-    Description: Alert when SP/RI expires within this many days
   OnDemandThreshold:
     Type: Number
     Default: 100
-    MinValue: 0
-    Description: Monthly On-Demand spend ($) that triggers missing coverage alert
   ScheduleExpression:
     Type: String
     Default: cron(0 9 * * ? *)
-    Description: When to run (default 9AM UTC daily). Use cron() or rate() syntax.
-  Enabled:
+  ScanLinkedAccounts:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
-    Description: Enable or disable the daily schedule
-
-Conditions:
-  IsEnabled: !Equals [!Ref Enabled, 'true']
+    Description: Scan linked accounts for RIs via cross-account roles
 
 Resources:
+
+  # ============================================================
+  # SNS Topic
+  # ============================================================
   AlertTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -63,7 +38,10 @@ Resources:
         - Protocol: email
           Endpoint: !Ref AlertEmail
 
-  LambdaRole:
+  # ============================================================
+  # IAM Role for Lambda (payer + cross-account)
+  # ============================================================
+  GuardianRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub cost-guardian-role-${AWS::Region}
@@ -92,12 +70,16 @@ Resources:
                   - ce:GetCostAndUsage
                   - ce:GetSavingsPlansPurchaseRecommendation
                   - ce:GetReservationPurchaseRecommendation
-                  - organizations:DescribeAccount
                   - organizations:ListAccounts
+                  - organizations:DescribeAccount
+                  - sts:AssumeRole
                   - sns:Publish
                   - ses:SendEmail
                 Resource: '*'
 
+  # ============================================================
+  # Core Lambda — shared by alerts + agent
+  # ============================================================
   GuardianFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -106,7 +88,7 @@ Resources:
       Handler: index.handler
       Timeout: 120
       MemorySize: 256
-      Role: !GetAtt LambdaRole.Arn
+      Role: !GetAtt GuardianRole.Arn
       Environment:
         Variables:
           SNS_TOPIC_ARN: !Ref AlertTopic
@@ -115,105 +97,99 @@ Resources:
           ALERT_EMAIL: !Ref AlertEmail
           SENDER_EMAIL: !Ref SenderEmail
           DEPLOY_REGION: !Ref AWS::Region
-          DEPLOY_ACCOUNT: !Ref AWS::AccountId
+          SCAN_LINKED: !Ref ScanLinkedAccounts
       Code:
         ZipFile: |
           import boto3, os, json
           from datetime import datetime, timezone, timedelta
 
           NOW = datetime.now(timezone.utc)
-          THRESHOLD = int(os.environ['ALERT_DAYS'])
-          OD_THRESHOLD = float(os.environ['OD_THRESHOLD'])
-          ALERT_EMAIL = os.environ['ALERT_EMAIL']
-          SENDER_EMAIL = os.environ['SENDER_EMAIL']
-          REGION = os.environ['DEPLOY_REGION']
-          ACCOUNT = os.environ['DEPLOY_ACCOUNT']
+          THRESHOLD = int(os.environ.get('ALERT_DAYS', '30'))
+          OD_THRESHOLD = float(os.environ.get('OD_THRESHOLD', '100'))
+          ALERT_EMAIL = os.environ.get('ALERT_EMAIL', '')
+          SENDER_EMAIL = os.environ.get('SENDER_EMAIL', '')
+          REGION = os.environ.get('DEPLOY_REGION', 'us-east-1')
+          SCAN_LINKED = os.environ.get('SCAN_LINKED', 'false') == 'true'
+          ACCOUNT = boto3.client('sts').get_caller_identity()['Account']
 
-          # Try to get org account name
+          CROSS_ACCOUNT_ROLE = 'cost-guardian-linked-role'
+
           def get_account_name():
               try:
-                  org = boto3.client('organizations')
-                  resp = org.describe_account(AccountId=ACCOUNT)
-                  return resp['Account']['Name']
+                  return boto3.client('organizations').describe_account(AccountId=ACCOUNT)['Account']['Name']
               except Exception:
                   return ACCOUNT
 
-          ACCOUNT_NAME = None  # lazy loaded
+          def get_linked_accounts():
+              if not SCAN_LINKED:
+                  return []
+              try:
+                  org = boto3.client('organizations')
+                  pages, accounts = org.get_paginator('list_accounts'), []
+                  for page in pages.paginate():
+                      for a in page['Accounts']:
+                          if a['Status'] == 'ACTIVE' and a['Id'] != ACCOUNT:
+                              accounts.append({'id': a['Id'], 'name': a['Name']})
+                  return accounts
+              except Exception:
+                  return []
 
-          STYLE = """
-          <style>
-            body{font-family:Arial,sans-serif;color:#333;margin:0;padding:20px}
-            .header{background:#232f3e;color:#fff;padding:20px;border-radius:8px 8px 0 0}
-            .header h1{margin:0;font-size:22px}.header p{margin:5px 0 0;opacity:.8;font-size:14px}
-            .content{border:1px solid #ddd;border-top:none;padding:20px;border-radius:0 0 8px 8px}
-            .section{margin-bottom:24px}
-            .section-title{font-size:16px;font-weight:700;margin-bottom:10px;padding:8px 12px;border-radius:4px}
-            .warn{background:#fff3cd;color:#856404}.danger{background:#f8d7da;color:#721c24}
-            .info{background:#d1ecf1;color:#0c5460}.success{background:#d4edda;color:#155724}
-            table{width:100%;border-collapse:collapse;margin-top:8px;font-size:14px}
-            th{background:#f8f9fa;text-align:left;padding:10px 12px;border:1px solid #dee2e6;font-weight:600}
-            td{padding:10px 12px;border:1px solid #dee2e6}
-            tr:nth-child(even){background:#f8f9fa}
-            .amt{text-align:right;font-family:monospace}
-            .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:700}
-            .badge-red{background:#dc3545;color:#fff}.badge-yellow{background:#ffc107;color:#333}
-            .badge-green{background:#28a745;color:#fff}
-            .summary-box{display:inline-block;background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;padding:12px 20px;margin:4px 8px 4px 0;text-align:center}
-            .summary-box .number{font-size:28px;font-weight:700;color:#232f3e}
-            .summary-box .label{font-size:11px;color:#666;text-transform:uppercase}
-            .footer{margin-top:20px;padding-top:16px;border-top:1px solid #ddd;font-size:12px;color:#666}
-            .config{background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;padding:10px;font-size:12px;color:#666;margin-top:16px}
-          </style>"""
-
-          def days_badge(d):
-              if d <= 7: return f'<span class="badge badge-red">{d}d</span>'
-              if d <= 14: return f'<span class="badge badge-yellow">{d}d</span>'
-              return f'<span class="badge badge-green">{d}d</span>'
+          def assume_role(account_id):
+              try:
+                  creds = boto3.client('sts').assume_role(
+                      RoleArn=f'arn:aws:iam::{account_id}:role/{CROSS_ACCOUNT_ROLE}',
+                      RoleSessionName='CostGuardian')['Credentials']
+                  return boto3.Session(
+                      aws_access_key_id=creds['AccessKeyId'],
+                      aws_secret_access_key=creds['SecretAccessKey'],
+                      aws_session_token=creds['SessionToken'])
+              except Exception:
+                  return None
 
           def check_savings_plans():
-              rows, sps = [], boto3.client('savingsplans').describe_savings_plans(states=['active'])['savingsPlans']
+              rows = []
+              sps = boto3.client('savingsplans').describe_savings_plans(states=['active'])['savingsPlans']
               for sp in sps:
                   end = datetime.fromisoformat(sp['end'].replace('Z', '+00:00'))
                   days = (end - NOW).days
-                  if days <= THRESHOLD:
-                      rows.append({'id': sp['savingsPlanId'][:12]+'...', 'type': sp['savingsPlanType'],
-                          'commitment': f"${sp['commitment']}/hr", 'expires': end.strftime('%Y-%m-%d'), 'days': days})
-              return rows, len(sps)
+                  rows.append({'id': sp['savingsPlanId'][:12]+'...', 'type': sp['savingsPlanType'],
+                      'commitment': f"${sp['commitment']}/hr", 'expires': end.strftime('%Y-%m-%d'),
+                      'days': days, 'account': ACCOUNT, 'expiring': days <= THRESHOLD})
+              return rows
 
-          def check_ris():
-              rows, total = [], 0
-              checks = [
-                  ('ec2', lambda: boto3.client('ec2').describe_reserved_instances(
+          def check_ris_for_session(session, account_id, account_name):
+              rows = []
+              svc_checks = [
+                  ('EC2', lambda s: s.client('ec2').describe_reserved_instances(
                       Filters=[{'Name':'state','Values':['active']}])['ReservedInstances'],
-                   lambda ri: ('EC2', f"{ri['InstanceCount']}x {ri['InstanceType']}",
+                   lambda ri: (f"{ri['InstanceCount']}x {ri['InstanceType']}",
                       ri['End'] if ri['End'].tzinfo else ri['End'].replace(tzinfo=timezone.utc))),
-                  ('rds', lambda: [r for r in boto3.client('rds').describe_reserved_db_instances()['ReservedDBInstances'] if r['State']=='active'],
-                   lambda ri: ('RDS', f"{ri['DBInstanceCount']}x {ri['DBInstanceClass']}",
+                  ('RDS', lambda s: [r for r in s.client('rds').describe_reserved_db_instances()['ReservedDBInstances'] if r['State']=='active'],
+                   lambda ri: (f"{ri['DBInstanceCount']}x {ri['DBInstanceClass']}",
                       (ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)) + timedelta(seconds=ri['Duration']))),
-                  ('opensearch', lambda: [r for r in boto3.client('opensearch').describe_reserved_instances()['ReservedInstances'] if r['State']=='active'],
-                   lambda ri: ('OpenSearch', f"{ri['InstanceCount']}x {ri['InstanceType']}",
+                  ('OpenSearch', lambda s: [r for r in s.client('opensearch').describe_reserved_instances()['ReservedInstances'] if r['State']=='active'],
+                   lambda ri: (f"{ri['InstanceCount']}x {ri['InstanceType']}",
                       (ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)) + timedelta(seconds=ri['Duration']))),
-                  ('elasticache', lambda: [r for r in boto3.client('elasticache').describe_reserved_cache_nodes()['ReservedCacheNodes'] if r['State']=='active'],
-                   lambda ri: ('ElastiCache', f"{ri['CacheNodeCount']}x {ri['CacheNodeType']}",
+                  ('ElastiCache', lambda s: [r for r in s.client('elasticache').describe_reserved_cache_nodes()['ReservedCacheNodes'] if r['State']=='active'],
+                   lambda ri: (f"{ri['CacheNodeCount']}x {ri['CacheNodeType']}",
                       (ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)) + timedelta(seconds=ri['Duration']))),
-                  ('redshift', lambda: [r for r in boto3.client('redshift').describe_reserved_nodes()['ReservedNodes'] if r['State']=='active'],
-                   lambda ri: ('Redshift', f"{ri['NodeCount']}x {ri['NodeType']}",
+                  ('Redshift', lambda s: [r for r in s.client('redshift').describe_reserved_nodes()['ReservedNodes'] if r['State']=='active'],
+                   lambda ri: (f"{ri['NodeCount']}x {ri['NodeType']}",
                       (ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)) + timedelta(seconds=int(ri['Duration'])))),
               ]
-              for name, fetch_fn, parse_fn in checks:
+              for svc, fetch, parse in svc_checks:
                   try:
-                      items = fetch_fn()
-                      total += len(items)
-                      for ri in items:
-                          svc, detail, end = parse_fn(ri)
+                      for ri in fetch(session):
+                          detail, end = parse(ri)
                           days = (end - NOW).days
-                          if days <= THRESHOLD:
-                              rows.append({'service': svc, 'detail': detail, 'expires': end.strftime('%Y-%m-%d'), 'days': days})
+                          rows.append({'service': svc, 'detail': detail, 'expires': end.strftime('%Y-%m-%d'),
+                              'days': days, 'account': account_id, 'account_name': account_name,
+                              'expiring': days <= THRESHOLD})
                   except Exception:
                       pass
-              return rows, total
+              return rows
 
-          def check_missing_coverage():
+          def check_on_demand():
               ce = boto3.client('ce')
               end = NOW.strftime('%Y-%m-01')
               start = (NOW.replace(day=1) - timedelta(days=1)).strftime('%Y-%m-01')
@@ -224,8 +200,7 @@ Resources:
               svcs, total = [], 0
               for g in resp.get('ResultsByTime', [{}])[0].get('Groups', []):
                   c = float(g['Metrics']['UnblendedCost']['Amount'])
-                  if c > 10:
-                      svcs.append((g['Keys'][0], c)); total += c
+                  if c > 10: svcs.append((g['Keys'][0], c)); total += c
               svcs.sort(key=lambda x: -x[1])
               return svcs, total
 
@@ -254,94 +229,195 @@ Resources:
                   except Exception: pass
               return recs
 
-          def build_html(sp_rows, sp_count, ri_rows, ri_count, od_svcs, od_total, recs):
-              global ACCOUNT_NAME
-              if ACCOUNT_NAME is None:
-                  ACCOUNT_NAME = get_account_name()
+          def collect_all():
+              """Collect all data — used by both alert and agent."""
+              # SPs (org-wide from payer)
+              all_sps = check_savings_plans()
+
+              # RIs — payer account
+              payer_session = boto3.Session()
+              all_ris = check_ris_for_session(payer_session, ACCOUNT, get_account_name())
+
+              # RIs — linked accounts
+              for acct in get_linked_accounts():
+                  session = assume_role(acct['id'])
+                  if session:
+                      all_ris.extend(check_ris_for_session(session, acct['id'], acct['name']))
+
+              # On-Demand + recommendations
+              od_svcs, od_total = check_on_demand()
+              recs = get_recommendations() if od_total > OD_THRESHOLD else []
+
+              return {
+                  'sps': all_sps,
+                  'ris': all_ris,
+                  'od_services': od_svcs,
+                  'od_total': od_total,
+                  'recommendations': recs,
+                  'account': ACCOUNT,
+                  'account_name': get_account_name(),
+                  'region': REGION,
+                  'threshold_days': THRESHOLD,
+                  'threshold_od': OD_THRESHOLD,
+              }
+
+          # ============================================================
+          # HTML email builder
+          # ============================================================
+          STYLE = """<style>
+            body{font-family:Arial,sans-serif;color:#333;margin:0;padding:20px}
+            .header{background:#232f3e;color:#fff;padding:20px;border-radius:8px 8px 0 0}
+            .header h1{margin:0;font-size:22px}.header p{margin:5px 0 0;opacity:.8;font-size:14px}
+            .content{border:1px solid #ddd;border-top:none;padding:20px;border-radius:0 0 8px 8px}
+            .section{margin-bottom:24px}
+            .stitle{font-size:16px;font-weight:700;margin-bottom:10px;padding:8px 12px;border-radius:4px}
+            .warn{background:#fff3cd;color:#856404}.danger{background:#f8d7da;color:#721c24}
+            .info{background:#d1ecf1;color:#0c5460}.success{background:#d4edda;color:#155724}
+            table{width:100%;border-collapse:collapse;margin-top:8px;font-size:14px}
+            th{background:#f8f9fa;text-align:left;padding:10px 12px;border:1px solid #dee2e6;font-weight:600}
+            td{padding:10px 12px;border:1px solid #dee2e6}tr:nth-child(even){background:#f8f9fa}
+            .amt{text-align:right;font-family:monospace}
+            .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:700}
+            .badge-red{background:#dc3545;color:#fff}.badge-yellow{background:#ffc107;color:#333}.badge-green{background:#28a745;color:#fff}
+            .sbox{display:inline-block;background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;padding:12px 20px;margin:4px 8px 4px 0;text-align:center}
+            .sbox .num{font-size:28px;font-weight:700;color:#232f3e}.sbox .lbl{font-size:11px;color:#666;text-transform:uppercase}
+            .footer{margin-top:20px;padding-top:16px;border-top:1px solid #ddd;font-size:12px;color:#666}
+            .config{background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;padding:10px;font-size:12px;color:#666;margin-top:16px}
+          </style>"""
+
+          def days_badge(d):
+              if d <= 7: return f'<span class="badge badge-red">{d}d</span>'
+              if d <= 14: return f'<span class="badge badge-yellow">{d}d</span>'
+              return f'<span class="badge badge-green">{d}d</span>'
+
+          def build_html(data):
+              exp_sps = [s for s in data['sps'] if s['expiring']]
+              exp_ris = [r for r in data['ris'] if r['expiring']]
+              od_svcs, od_total = data['od_services'], data['od_total']
+              recs = data['recommendations']
 
               html = f"""<html><head>{STYLE}</head><body>
               <div class="header"><h1>AWS Cost Guardian</h1>
-              <p>{ACCOUNT_NAME} ({ACCOUNT}) &nbsp;|&nbsp; {REGION} &nbsp;|&nbsp; {NOW:%B %d, %Y}</p></div>
+              <p>{data['account_name']} ({data['account']}) | {data['region']} | {NOW:%B %d, %Y}</p></div>
               <div class="content">
               <div style="margin-bottom:20px">
-                <div class="summary-box"><div class="number">{len(sp_rows)+len(ri_rows)}</div><div class="label">Expiring SP/RI</div></div>
-                <div class="summary-box"><div class="number">{sp_count+ri_count}</div><div class="label">Active SP/RI</div></div>
-                <div class="summary-box"><div class="number">${od_total:,.0f}</div><div class="label">On-Demand/mo</div></div>
-                <div class="summary-box"><div class="number">${sum(r['savings'] for r in recs):,.0f}</div><div class="label">Potential Savings/mo</div></div>
+                <div class="sbox"><div class="num">{len(exp_sps)+len(exp_ris)}</div><div class="lbl">Expiring</div></div>
+                <div class="sbox"><div class="num">{len(data['sps'])+len(data['ris'])}</div><div class="lbl">Active SP/RI</div></div>
+                <div class="sbox"><div class="num">${od_total:,.0f}</div><div class="lbl">On-Demand/mo</div></div>
+                <div class="sbox"><div class="num">${sum(r['savings'] for r in recs):,.0f}</div><div class="lbl">Potential Savings</div></div>
               </div>"""
 
-              if sp_rows:
-                  html += '<div class="section"><div class="section-title warn">&#9888;&#65039; Savings Plans Expiring</div>'
-                  html += '<table><tr><th>Plan ID</th><th>Type</th><th>Commitment</th><th>Expires</th><th>Days Left</th></tr>'
-                  for r in sorted(sp_rows, key=lambda x: x['days']):
+              if exp_sps:
+                  html += '<div class="section"><div class="stitle warn">&#9888;&#65039; Savings Plans Expiring</div>'
+                  html += '<table><tr><th>Plan ID</th><th>Type</th><th>Commitment</th><th>Expires</th><th>Days</th></tr>'
+                  for r in sorted(exp_sps, key=lambda x: x['days']):
                       html += f"<tr><td>{r['id']}</td><td>{r['type']}</td><td class='amt'>{r['commitment']}</td><td>{r['expires']}</td><td>{days_badge(r['days'])}</td></tr>"
                   html += '</table></div>'
 
-              if ri_rows:
-                  html += '<div class="section"><div class="section-title warn">&#9888;&#65039; Reserved Instances Expiring</div>'
-                  html += '<table><tr><th>Service</th><th>Instance Details</th><th>Expires</th><th>Days Left</th></tr>'
-                  for r in sorted(ri_rows, key=lambda x: x['days']):
-                      html += f"<tr><td>{r['service']}</td><td>{r['detail']}</td><td>{r['expires']}</td><td>{days_badge(r['days'])}</td></tr>"
+              if exp_ris:
+                  html += '<div class="section"><div class="stitle warn">&#9888;&#65039; Reserved Instances Expiring</div>'
+                  html += '<table><tr><th>Account</th><th>Service</th><th>Details</th><th>Expires</th><th>Days</th></tr>'
+                  for r in sorted(exp_ris, key=lambda x: x['days']):
+                      html += f"<tr><td>{r.get('account_name', r['account'])}</td><td>{r['service']}</td><td>{r['detail']}</td><td>{r['expires']}</td><td>{days_badge(r['days'])}</td></tr>"
                   html += '</table></div>'
 
               if od_total > OD_THRESHOLD:
-                  no_coverage = sp_count == 0 and ri_count == 0
-                  html += f'<div class="section"><div class="section-title danger">&#128176; On-Demand Spend: ${od_total:,.0f}/mo</div>'
-                  if no_coverage:
-                      html += '<p style="color:#dc3545;font-weight:700">&#10060; No active Savings Plans or Reserved Instances in this account</p>'
-                  html += '<table><tr><th>Service</th><th style="text-align:right">Monthly Cost</th><th style="text-align:right">% of Total</th></tr>'
+                  no_cov = len(data['sps']) == 0 and len(data['ris']) == 0
+                  html += f'<div class="section"><div class="stitle danger">&#128176; On-Demand: ${od_total:,.0f}/mo</div>'
+                  if no_cov:
+                      html += '<p style="color:#dc3545;font-weight:700">&#10060; No active Savings Plans or Reserved Instances</p>'
+                  html += '<table><tr><th>Service</th><th style="text-align:right">Monthly</th><th style="text-align:right">%</th></tr>'
                   for svc, cost in od_svcs[:10]:
                       pct = cost/od_total*100 if od_total else 0
                       html += f'<tr><td>{svc}</td><td class="amt">${cost:,.0f}</td><td class="amt">{pct:.1f}% <span style="display:inline-block;background:#dc3545;height:10px;width:{int(pct*2)}px;border-radius:2px"></span></td></tr>'
                   html += '</table></div>'
 
               if recs:
-                  html += '<div class="section"><div class="section-title info">&#128203; Purchase Recommendations</div>'
-                  html += '<table><tr><th>Type</th><th>Term</th><th>Commitment</th><th style="text-align:right">Est. Savings/mo</th></tr>'
+                  html += '<div class="section"><div class="stitle info">&#128203; Recommendations</div>'
+                  html += '<table><tr><th>Type</th><th>Term</th><th>Commitment</th><th style="text-align:right">Savings/mo</th></tr>'
                   for r in recs:
                       html += f"<tr><td>{r['type']}</td><td>{r['term']}</td><td>{r['commitment']}</td><td class='amt' style='color:#28a745;font-weight:700'>${r['savings']:,.0f}</td></tr>"
                   html += '</table></div>'
 
-              if not sp_rows and not ri_rows and od_total <= OD_THRESHOLD:
-                  html += '<div class="section"><div class="section-title success">&#9989; All Clear</div></div>'
+              if not exp_sps and not exp_ris and od_total <= OD_THRESHOLD:
+                  html += '<div class="section"><div class="stitle success">&#9989; All Clear</div></div>'
 
-              html += f"""
-              <div class="footer">
-                <p>&#128279; <a href="https://{REGION}.console.aws.amazon.com/cost-management/home#/savings-plans/recommendations">SP Recommendations</a>
-                &nbsp;|&nbsp; <a href="https://{REGION}.console.aws.amazon.com/cost-management/home#/reservations/recommendations">RI Recommendations</a>
-                &nbsp;|&nbsp; <a href="https://{REGION}.console.aws.amazon.com/cost-management/home#/cost-explorer">Cost Explorer</a></p>
-                <div class="config">Alert threshold: {THRESHOLD} days &nbsp;|&nbsp; On-Demand threshold: ${OD_THRESHOLD:,.0f}/mo &nbsp;|&nbsp; Region: {REGION} &nbsp;|&nbsp; Schedule: Daily 9:00 AM UTC</div>
+              linked_count = len(get_linked_accounts()) if SCAN_LINKED else 0
+              html += f"""<div class="footer">
+                <p><a href="https://{REGION}.console.aws.amazon.com/cost-management/home#/savings-plans/recommendations">SP Recs</a>
+                | <a href="https://{REGION}.console.aws.amazon.com/cost-management/home#/reservations/recommendations">RI Recs</a>
+                | <a href="https://{REGION}.console.aws.amazon.com/cost-management/home#/cost-explorer">Cost Explorer</a></p>
+                <div class="config">Threshold: {THRESHOLD}d | OD: ${OD_THRESHOLD:,.0f}/mo | Linked accounts scanned: {linked_count} | Region: {REGION}</div>
               </div></div></body></html>"""
               return html
 
+          # ============================================================
+          # Handler — supports alert mode + agent query mode
+          # ============================================================
           def handler(event, context):
-              sp_rows, sp_count = check_savings_plans()
-              ri_rows, ri_count = check_ris()
-              od_svcs, od_total = check_missing_coverage()
-              recs = get_recommendations() if od_total > OD_THRESHOLD else []
-              needs_alert = bool(sp_rows) or bool(ri_rows) or od_total > OD_THRESHOLD
+              # Agent mode: return structured data
+              action = event.get('action', 'alert')
+
+              data = collect_all()
+
+              if action == 'query':
+                  # Return structured JSON for agent consumption
+                  query = event.get('query', '').lower()
+
+                  if 'expir' in query:
+                      exp = [s for s in data['sps'] if s['expiring']] + [r for r in data['ris'] if r['expiring']]
+                      return {'answer': f"{len(exp)} SP/RIs expiring within {THRESHOLD} days", 'details': exp}
+
+                  if 'recommend' in query:
+                      return {'answer': f"{len(data['recommendations'])} recommendations found", 'details': data['recommendations']}
+
+                  if 'on-demand' in query or 'coverage' in query or 'savings' in query:
+                      return {'answer': f"${data['od_total']:,.0f}/mo On-Demand across {len(data['od_services'])} services",
+                              'services': data['od_services'][:10], 'recommendations': data['recommendations']}
+
+                  if 'summary' in query or 'status' in query or 'overview' in query:
+                      return {
+                          'account': data['account_name'],
+                          'active_sps': len(data['sps']),
+                          'active_ris': len(data['ris']),
+                          'expiring_sps': len([s for s in data['sps'] if s['expiring']]),
+                          'expiring_ris': len([r for r in data['ris'] if r['expiring']]),
+                          'on_demand_monthly': f"${data['od_total']:,.0f}",
+                          'potential_savings': f"${sum(r['savings'] for r in data['recommendations']):,.0f}/mo",
+                          'linked_accounts_scanned': len(get_linked_accounts()) if SCAN_LINKED else 0
+                      }
+
+                  # Default: return everything
+                  return data
+
+              # Alert mode: send HTML email
+              exp_sps = [s for s in data['sps'] if s['expiring']]
+              exp_ris = [r for r in data['ris'] if r['expiring']]
+              needs_alert = bool(exp_sps) or bool(exp_ris) or data['od_total'] > OD_THRESHOLD
 
               if needs_alert:
-                  html = build_html(sp_rows, sp_count, ri_rows, ri_count, od_svcs, od_total, recs)
+                  html = build_html(data)
                   subj = f"[{ACCOUNT}] Cost Guardian"
-                  if sp_rows or ri_rows: subj += f" — {len(sp_rows)+len(ri_rows)} Expiring"
-                  if od_total > OD_THRESHOLD and sp_count==0 and ri_count==0:
-                      subj += f" — ${od_total:,.0f}/mo No Coverage"
+                  if exp_sps or exp_ris: subj += f" — {len(exp_sps)+len(exp_ris)} Expiring"
+                  if data['od_total'] > OD_THRESHOLD and not data['sps'] and not data['ris']:
+                      subj += f" — ${data['od_total']:,.0f}/mo No Coverage"
                   boto3.client('ses', region_name=REGION).send_email(
                       Source=SENDER_EMAIL, Destination={'ToAddresses': [ALERT_EMAIL]},
                       Message={'Subject': {'Data': subj}, 'Body': {'Html': {'Data': html}}})
                   print(f"Alert sent to {ALERT_EMAIL}")
               else:
                   print("All clear")
-              return {'expiring_sps': len(sp_rows), 'expiring_ris': len(ri_rows),
-                      'on_demand_total': od_total, 'alerted': needs_alert}
 
+              return {'expiring_sps': len(exp_sps), 'expiring_ris': len(exp_ris),
+                      'on_demand_total': data['od_total'], 'alerted': needs_alert}
+
+  # ============================================================
+  # EventBridge daily schedule
+  # ============================================================
   DailySchedule:
     Type: AWS::Events::Rule
-    Condition: IsEnabled
     Properties:
       Name: cost-guardian-daily
-      Description: Daily SP/RI expiration and coverage check
       ScheduleExpression: !Ref ScheduleExpression
       State: ENABLED
       Targets:
@@ -350,22 +426,26 @@ Resources:
 
   SchedulePermission:
     Type: AWS::Lambda::Permission
-    Condition: IsEnabled
     Properties:
       Action: lambda:InvokeFunction
       FunctionName: !Ref GuardianFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt DailySchedule.Arn
 
+  # ============================================================
+  # Agent Lambda URL (for interactive queries)
+  # ============================================================
+  AgentFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: AWS_IAM
+      TargetFunctionArn: !GetAtt GuardianFunction.Arn
+
 Outputs:
-  TopicArn:
-    Value: !Ref AlertTopic
   FunctionArn:
     Value: !GetAtt GuardianFunction.Arn
-  Configuration:
-    Value: !Sub |
-      Account: ${AWS::AccountId}
-      Region: ${AWS::Region}
-      AlertDays: ${AlertDays}
-      OnDemandThreshold: $${OnDemandThreshold}
-      Schedule: ${ScheduleExpression}
+  FunctionUrl:
+    Value: !GetAtt AgentFunctionUrl.FunctionUrl
+    Description: Invoke with action=query for interactive mode
+  TopicArn:
+    Value: !Ref AlertTopic

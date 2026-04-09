@@ -1,80 +1,107 @@
 # AWS Cost Guardian
 
-Automated monitoring for AWS Savings Plans and Reserved Instances — expiration alerts, missing coverage detection, and purchase recommendations delivered as styled HTML emails.
+Automated SP/RI monitoring with email alerts and interactive queries. Deploy to the **payer (management) account** for org-wide visibility.
 
-**Deploy to the payer (management) account** for org-wide visibility across all linked accounts.
+## Features
 
-## What It Does
-
-| Check | Alert When |
+| Feature | Description |
 |---|---|
-| SP Expiration | Savings Plan expires within N days |
-| RI Expiration | Any RI (EC2, RDS, OpenSearch, ElastiCache, Redshift) expires within N days |
-| Missing Coverage | On-Demand spend exceeds threshold with no active SP/RI |
-| Recommendations | Includes AWS purchase recommendations with estimated savings |
+| SP Expiration Alerts | Alerts N days before any Savings Plan expires |
+| RI Expiration Alerts | Scans EC2, RDS, OpenSearch, ElastiCache, Redshift RIs |
+| Cross-Account Scanning | Scans linked accounts for RIs via StackSet role |
+| Missing Coverage | Detects On-Demand spend with no SP/RI and shows recommendations |
+| HTML Email Reports | Styled tables with color-coded badges via SES |
+| Interactive Queries | Query cost data on demand via CLI |
 
 ## Architecture
 
 ```
-EventBridge (configurable cron)
-       │
-       ▼
-Lambda (cost-guardian)
-       │
-       ├── Savings Plans API
-       ├── EC2/RDS/OpenSearch/ElastiCache/Redshift RI APIs
-       ├── Cost Explorer (On-Demand spend + recommendations)
-       │
-       ▼
-SES → Styled HTML email with tables
+Payer Account
+├── EventBridge (daily) → Lambda → SES HTML Email
+├── Lambda URL → Interactive queries
+└── AssumeRole → Linked Account 1..N (RI scan)
 ```
 
-## Deploy
+## Quick Start
 
 ```bash
-# Basic — defaults to 30 days, $100 threshold, 9AM UTC daily
-./deploy.sh --email team@company.com
+# 1. Deploy to payer account
+./deploy.sh --email finance@company.com
 
-# Custom thresholds
-./deploy.sh --email team@company.com --days 60 --threshold 500
+# 2. Confirm SNS email subscription
 
-# Different region
-./deploy.sh --email team@company.com --region us-west-2
-
-# Weekdays only at 2PM UTC
-./deploy.sh --email team@company.com --schedule "cron(0 14 ? * MON-FRI *)"
-
-# Tear down
-./deploy.sh --teardown --region us-east-1
+# 3. Test
+./query.sh summary
+./query.sh "what's expiring?"
+./query.sh "show recommendations"
+./query.sh "on-demand spend"
 ```
 
-## Parameters
+## Cross-Account RI Scanning
 
-| Parameter | Default | Description |
+To scan RIs in linked accounts, deploy the role via StackSet:
+
+```bash
+# Get your payer account ID
+PAYER=$(aws sts get-caller-identity --query Account --output text)
+
+# Deploy to each linked account (or use StackSets)
+aws cloudformation deploy \
+  --template-file linked-account-role.yaml \
+  --stack-name cost-guardian-linked-role \
+  --parameter-overrides PayerAccountId=$PAYER \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+## All Parameters
+
+```bash
+./deploy.sh \
+  --email team@company.com \
+  --sender noreply@company.com \
+  --days 60 \
+  --threshold 500 \
+  --region us-west-2 \
+  --schedule "cron(0 14 ? * MON-FRI *)" \
+  --scan-linked true
+```
+
+| Flag | Default | Description |
 |---|---|---|
-| `--email` | (required) | Recipient email |
+| `--email` | (required) | Alert recipient |
 | `--sender` | same as email | SES verified sender |
-| `--days` | `30` | Days before expiry to alert |
-| `--threshold` | `100` | On-Demand monthly $ threshold |
-| `--schedule` | `cron(0 9 * * ? *)` | EventBridge schedule (UTC) |
-| `--region` | `us-east-1` | AWS region |
-| `--disable` | | Deploy with schedule off |
+| `--days` | 30 | Days before expiry to alert |
+| `--threshold` | 100 | On-Demand $ threshold |
+| `--region` | us-east-1 | AWS region |
+| `--schedule` | Daily 9AM UTC | EventBridge cron |
+| `--scan-linked` | true | Scan linked accounts |
+| `--teardown` | | Delete stack |
+
+## Interactive Queries
+
+```bash
+./query.sh summary              # Overall status
+./query.sh "what's expiring?"   # Expiring SP/RIs
+./query.sh "recommendations"    # Purchase recommendations
+./query.sh "on-demand spend"    # On-Demand breakdown
+```
 
 ## Why Payer Account?
 
-- Cost Explorer APIs return org-wide data only from the management account
-- Savings Plans are purchased at the payer level
-- RIs purchased with org sharing are visible from the payer
-- Linked accounts only see their own RIs
-
-## Prerequisites
-
-- SES verified sender email (or SES out of sandbox for production)
-- IAM permissions to deploy CloudFormation with IAM resources
+- Cost Explorer APIs return org-wide data only from management account
+- Savings Plans are purchased at payer level
+- Cross-account RI scanning requires AssumeRole from payer
+- Single deployment covers entire organization
 
 ## Cost
 
-~$0.01/month — 1 Lambda invocation/day + SES email.
+~$0.01/month (1 Lambda/day + SES email).
+
+## Tear Down
+
+```bash
+./deploy.sh --teardown
+```
 
 ## License
 
