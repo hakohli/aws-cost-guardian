@@ -72,7 +72,7 @@ Resources:
           ALERT_DAYS: !Ref AlertDays
           OD_THRESHOLD: !Ref OnDemandThreshold
       Code:
-        ZipFile: !Sub |
+        ZipFile: |
           import boto3, os, json
           from datetime import datetime, timezone, timedelta
 
