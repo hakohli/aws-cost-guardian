@@ -1,0 +1,333 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Cost Guardian — SP/RI expiration alerts and missing coverage recommendations
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address for cost alerts
+  AlertDays:
+    Type: Number
+    Default: 30
+    Description: Days before SP/RI expiry to start alerting
+  OnDemandThreshold:
+    Type: Number
+    Default: 100
+    Description: Monthly On-Demand spend ($) that triggers missing SP/RI alert
+
+Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cost-guardian-alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cost-guardian-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CostGuardianPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - savingsplans:DescribeSavingsPlans
+                  - ec2:DescribeReservedInstances
+                  - rds:DescribeReservedDBInstances
+                  - es:DescribeReservedInstances
+                  - elasticache:DescribeReservedCacheNodes
+                  - redshift:DescribeReservedNodes
+                  - ce:GetCostAndUsage
+                  - ce:GetSavingsPlansPurchaseRecommendation
+                  - ce:GetReservationPurchaseRecommendation
+                  - ce:GetSavingsPlansCoverage
+                  - ce:GetReservationCoverage
+                  - sns:Publish
+                Resource: '*'
+
+  GuardianFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cost-guardian
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          ALERT_DAYS: !Ref AlertDays
+          OD_THRESHOLD: !Ref OnDemandThreshold
+      Code:
+        ZipFile: !Sub |
+          import boto3, os, json
+          from datetime import datetime, timezone, timedelta
+
+          NOW = datetime.now(timezone.utc)
+          THRESHOLD = int(os.environ['ALERT_DAYS'])
+          OD_THRESHOLD = float(os.environ['OD_THRESHOLD'])
+          TOPIC = os.environ['SNS_TOPIC_ARN']
+          ACCOUNT = boto3.client('sts').get_caller_identity()['Account']
+
+
+          def check_savings_plans():
+              alerts = []
+              sps = boto3.client('savingsplans').describe_savings_plans(
+                  states=['active'])['savingsPlans']
+              if not sps:
+                  return alerts, 0
+              for sp in sps:
+                  end = datetime.fromisoformat(sp['end'].replace('Z', '+00:00'))
+                  days = (end - NOW).days
+                  if days <= THRESHOLD:
+                      alerts.append(
+                          f"  • SP {sp['savingsPlanId'][:12]}... "
+                          f"({sp['savingsPlanType']}, ${sp['commitment']}/hr) "
+                          f"— {days} days left (expires {end:%Y-%m-%d})")
+              return alerts, len(sps)
+
+
+          def check_ris():
+              alerts = []
+              total = 0
+
+              # EC2
+              ris = boto3.client('ec2').describe_reserved_instances(
+                  Filters=[{'Name': 'state', 'Values': ['active']}])['ReservedInstances']
+              total += len(ris)
+              for ri in ris:
+                  end = ri['End'] if ri['End'].tzinfo else ri['End'].replace(tzinfo=timezone.utc)
+                  days = (end - NOW).days
+                  if days <= THRESHOLD:
+                      alerts.append(
+                          f"  • EC2 RI: {ri['InstanceCount']}x {ri['InstanceType']} "
+                          f"— {days} days left (expires {end:%Y-%m-%d})")
+
+              # RDS
+              for ri in boto3.client('rds').describe_reserved_db_instances()['ReservedDBInstances']:
+                  if ri['State'] != 'active':
+                      continue
+                  total += 1
+                  start = ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)
+                  end = start + timedelta(seconds=ri['Duration'])
+                  days = (end - NOW).days
+                  if days <= THRESHOLD:
+                      alerts.append(
+                          f"  • RDS RI: {ri['DBInstanceCount']}x {ri['DBInstanceClass']} "
+                          f"— {days} days left (expires {end:%Y-%m-%d})")
+
+              # OpenSearch
+              try:
+                  for ri in boto3.client('opensearch').describe_reserved_instances()['ReservedInstances']:
+                      if ri['State'] != 'active':
+                          continue
+                      total += 1
+                      start = ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)
+                      end = start + timedelta(seconds=ri['Duration'])
+                      days = (end - NOW).days
+                      if days <= THRESHOLD:
+                          alerts.append(
+                              f"  • OpenSearch RI: {ri['InstanceCount']}x {ri['InstanceType']} "
+                              f"— {days} days left (expires {end:%Y-%m-%d})")
+              except Exception:
+                  pass
+
+              # ElastiCache
+              try:
+                  for ri in boto3.client('elasticache').describe_reserved_cache_nodes()['ReservedCacheNodes']:
+                      if ri['State'] != 'active':
+                          continue
+                      total += 1
+                      start = ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)
+                      end = start + timedelta(seconds=ri['Duration'])
+                      days = (end - NOW).days
+                      if days <= THRESHOLD:
+                          alerts.append(
+                              f"  • ElastiCache RI: {ri['CacheNodeCount']}x {ri['CacheNodeType']} "
+                              f"— {days} days left (expires {end:%Y-%m-%d})")
+              except Exception:
+                  pass
+
+              # Redshift
+              try:
+                  for ri in boto3.client('redshift').describe_reserved_nodes()['ReservedNodes']:
+                      if ri['State'] != 'active':
+                          continue
+                      total += 1
+                      start = ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)
+                      end = start + timedelta(seconds=int(ri['Duration']))
+                      days = (end - NOW).days
+                      if days <= THRESHOLD:
+                          alerts.append(
+                              f"  • Redshift RI: {ri['NodeCount']}x {ri['NodeType']} "
+                              f"— {days} days left (expires {end:%Y-%m-%d})")
+              except Exception:
+                  pass
+
+              return alerts, total
+
+
+          def check_missing_coverage():
+              """Check if there's significant On-Demand spend with no SP/RI coverage."""
+              ce = boto3.client('ce')
+              end = NOW.strftime('%Y-%m-01')
+              start = (NOW.replace(day=1) - timedelta(days=1)).strftime('%Y-%m-01')
+
+              # Get On-Demand spend by service
+              resp = ce.get_cost_and_usage(
+                  TimePeriod={'Start': start, 'End': end},
+                  Granularity='MONTHLY',
+                  Metrics=['UnblendedCost'],
+                  Filter={'Dimensions': {'Key': 'PURCHASE_TYPE', 'Values': ['On Demand Instances']}},
+                  GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}])
+
+              od_services = []
+              total_od = 0
+              for group in resp.get('ResultsByTime', [{}])[0].get('Groups', []):
+                  cost = float(group['Metrics']['UnblendedCost']['Amount'])
+                  if cost > 10:
+                      od_services.append((group['Keys'][0], cost))
+                      total_od += cost
+
+              od_services.sort(key=lambda x: -x[1])
+              return od_services, total_od
+
+
+          def get_recommendations():
+              """Pull SP and RI purchase recommendations from Cost Explorer."""
+              ce = boto3.client('ce')
+              recs = []
+
+              # SP recommendations
+              try:
+                  resp = ce.get_savings_plans_purchase_recommendation(
+                      SavingsPlansType='COMPUTE_SP',
+                      LookbackPeriodInDays='THIRTY_DAYS',
+                      PaymentOption='NO_UPFRONT',
+                      TermInYears='ONE_YEAR')
+                  sp_rec = resp.get('SavingsPlansPurchaseRecommendation', {})
+                  summary = sp_rec.get('SavingsPlansPurchaseRecommendationSummary', {})
+                  if summary.get('EstimatedMonthlySavingsAmount'):
+                      savings = float(summary['EstimatedMonthlySavingsAmount'])
+                      commitment = summary.get('HourlyCommitmentToPurchase', '?')
+                      if savings > 0:
+                          recs.append(
+                              f"  • Compute SP (1yr No Upfront): ${commitment}/hr commitment "
+                              f"→ saves ~${savings:,.0f}/mo")
+              except Exception:
+                  pass
+
+              # EC2 RI recommendations
+              for svc in ['Amazon Elastic Compute Cloud - Compute',
+                          'Amazon Relational Database Service',
+                          'Amazon OpenSearch Service']:
+                  try:
+                      resp = ce.get_reservation_purchase_recommendation(
+                          Service=svc,
+                          LookbackPeriodInDays='THIRTY_DAYS',
+                          PaymentOption='NO_UPFRONT',
+                          TermInYears='ONE_YEAR')
+                      for rec in resp.get('Recommendations', []):
+                          for detail in rec.get('RecommendationDetails', [])[:3]:
+                              savings = float(detail.get('EstimatedMonthlySavingsAmount', 0))
+                              if savings > 10:
+                                  instance = detail.get('InstanceDetails', {})
+                                  desc = json.dumps(instance)[:80] if instance else 'N/A'
+                                  recs.append(f"  • {svc.split('-')[0].strip()} RI: {desc} → saves ~${savings:,.0f}/mo")
+                  except Exception:
+                      pass
+
+              return recs
+
+
+          def handler(event, context):
+              sections = []
+              needs_alert = False
+
+              # 1. Expiring SPs
+              sp_alerts, sp_count = check_savings_plans()
+              if sp_alerts:
+                  sections.append("⚠️ SAVINGS PLANS EXPIRING\n" + "\n".join(sp_alerts))
+                  needs_alert = True
+
+              # 2. Expiring RIs
+              ri_alerts, ri_count = check_ris()
+              if ri_alerts:
+                  sections.append("⚠️ RESERVED INSTANCES EXPIRING\n" + "\n".join(ri_alerts))
+                  needs_alert = True
+
+              # 3. Missing coverage
+              od_services, total_od = check_missing_coverage()
+              if total_od > OD_THRESHOLD:
+                  lines = [f"  • {svc}: ${cost:,.0f}/mo On-Demand" for svc, cost in od_services[:10]]
+                  header = f"💰 ON-DEMAND SPEND WITHOUT SP/RI COVERAGE: ${total_od:,.0f}/mo"
+                  if sp_count == 0 and ri_count == 0:
+                      header += "\n  ❌ You have NO active Savings Plans or Reserved Instances"
+                  sections.append(header + "\n" + "\n".join(lines))
+                  needs_alert = True
+
+                  # 4. Recommendations
+                  recs = get_recommendations()
+                  if recs:
+                      sections.append("📋 PURCHASE RECOMMENDATIONS\n" + "\n".join(recs))
+
+              if needs_alert:
+                  subject = f"[{ACCOUNT}] Cost Guardian Alert"
+                  body = f"AWS Cost Guardian — {NOW:%Y-%m-%d}\nAccount: {ACCOUNT}\n\n"
+                  body += "\n\n".join(sections)
+                  body += "\n\n---\nAction: Review recommendations in AWS Cost Explorer → Savings Plans / Reservations."
+                  boto3.client('sns').publish(
+                      TopicArn=TOPIC, Subject=subject, Message=body)
+                  print(f"Alert sent: {len(sections)} sections")
+              else:
+                  print("All clear — no expiring SPs/RIs, coverage looks good")
+
+              return {
+                  'expiring_sps': len(sp_alerts),
+                  'expiring_ris': len(ri_alerts),
+                  'on_demand_total': total_od,
+                  'alerted': needs_alert
+              }
+
+  DailySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: cost-guardian-daily
+      Description: Daily SP/RI expiration and coverage check
+      ScheduleExpression: cron(0 9 * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt GuardianFunction.Arn
+          Id: DailyCheck
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GuardianFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailySchedule.Arn
+
+Outputs:
+  TopicArn:
+    Description: SNS topic for alerts
+    Value: !Ref AlertTopic
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt GuardianFunction.Arn
+  DashboardUrl:
+    Description: Cost Explorer link
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cost-management/home#/savings-plans/recommendations'
