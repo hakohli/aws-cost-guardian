@@ -1,26 +1,72 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: AWS Cost Guardian — Alerts + QuickSight Chat Agent data layer
+Description: >
+  AWS Cost Guardian — Automated SP/RI expiration alerts, missing coverage detection,
+  purchase recommendations, and QuickSight Chat Agent data layer.
+  Deploy to your payer (management) account for org-wide visibility.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "📧 Notification Settings"
+        Parameters:
+          - AlertEmail
+          - SenderEmail
+      - Label:
+          default: "⚙️ Alert Thresholds"
+        Parameters:
+          - AlertDays
+          - OnDemandThreshold
+      - Label:
+          default: "🕐 Schedule & Scope"
+        Parameters:
+          - ScheduleExpression
+          - ScanLinkedAccounts
+    ParameterLabels:
+      AlertEmail:
+        default: "Alert Email — Who should receive cost alerts?"
+      SenderEmail:
+        default: "Sender Email — SES verified email to send from"
+      AlertDays:
+        default: "Expiry Alert Window — How many days before SP/RI expiry to alert?"
+      OnDemandThreshold:
+        default: "On-Demand Threshold ($) — Alert when monthly On-Demand exceeds this amount"
+      ScheduleExpression:
+        default: "Schedule — When should the check run? (UTC cron expression)"
+      ScanLinkedAccounts:
+        default: "Scan Linked Accounts — Check RIs in linked accounts via cross-account role?"
 
 Parameters:
   AlertEmail:
     Type: String
+    Description: Email address to receive daily cost alerts and expiry warnings
     AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
   SenderEmail:
     Type: String
+    Description: SES verified email address to send alerts from (can be same as Alert Email)
     AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid, SES-verified email address
   AlertDays:
     Type: Number
     Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days before SP/RI expiration to start sending alerts (e.g., 30 = alert 30 days before expiry)
   OnDemandThreshold:
     Type: Number
     Default: 100
+    MinValue: 0
+    Description: Monthly On-Demand spend in USD that triggers a missing coverage alert (e.g., 500 = alert when On-Demand exceeds $500/mo)
   ScheduleExpression:
     Type: String
     Default: cron(0 9 * * ? *)
+    Description: "EventBridge cron or rate expression in UTC (default: daily at 9:00 AM UTC)"
   ScanLinkedAccounts:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
+    Description: "Enable cross-account RI scanning. Requires cost-guardian-linked-role deployed to linked accounts via StackSet."
 
 Resources:
 
