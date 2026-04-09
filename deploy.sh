@@ -1,5 +1,4 @@
 #!/bin/bash
-# Deploy AWS Cost Guardian to payer account
 set -euo pipefail
 
 usage() {
@@ -17,11 +16,6 @@ Optional:
   --region          AWS region (default: us-east-1)
   --scan-linked     Scan linked accounts for RIs (default: true)
   --teardown        Delete the stack
-
-Interactive queries:
-  ./query.sh summary
-  ./query.sh "what's expiring?"
-  ./query.sh "show recommendations"
 EOF
   exit 1
 }
@@ -52,6 +46,8 @@ fi
 [[ -z "$EMAIL" ]] && usage
 [[ -z "$SENDER" ]] && SENDER="$EMAIL"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+BUCKET="cost-guardian-data-${ACCOUNT}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "╔══════════════════════════════════════════════╗"
 echo "║         AWS Cost Guardian — Deploy           ║"
@@ -62,12 +58,19 @@ printf "║  Email:         %-28s║\n" "$EMAIL"
 printf "║  Alert Days:    %-28s║\n" "$DAYS"
 printf "║  OD Threshold:  \$%-27s║\n" "$THRESHOLD"
 printf "║  Scan Linked:   %-28s║\n" "$SCAN"
-printf "║  Schedule:      %-28s║\n" "$SCHEDULE"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
 
+# Package Lambda
+echo "📦 Packaging Lambda..."
+cd "$SCRIPT_DIR/lambda"
+zip -q /tmp/cost-guardian.zip index.py
+cd "$SCRIPT_DIR"
+
+# Deploy (first pass creates bucket, Lambda uses inline placeholder)
+echo "🚀 Deploying stack..."
 aws cloudformation deploy \
-  --template-file "$(dirname "$0")/template.yaml" \
+  --template-file "$SCRIPT_DIR/template.yaml" \
   --stack-name aws-cost-guardian \
   --parameter-overrides \
     AlertEmail="$EMAIL" \
@@ -79,13 +82,23 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION"
 
+# Get the CFN-generated bucket name
+BUCKET=$(aws cloudformation describe-stacks --stack-name aws-cost-guardian --region "$REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`DataBucket`].OutputValue' --output text)
+
+# Upload Lambda code to the bucket and update function
+aws s3 cp /tmp/cost-guardian.zip "s3://${BUCKET}/lambda/cost-guardian.zip" --region "$REGION"
+aws lambda update-function-code \
+  --function-name cost-guardian \
+  --s3-bucket "$BUCKET" \
+  --s3-key lambda/cost-guardian.zip \
+  --region "$REGION" > /dev/null
+
 echo ""
 echo "✅ Deployed to $ACCOUNT ($REGION)"
 echo ""
 echo "Next steps:"
 echo "  1. Confirm SNS email subscription"
-echo "  2. Test alert:  aws lambda invoke --function-name cost-guardian --region $REGION --cli-binary-format raw-in-base64-out --payload '{}' /dev/stdout"
-echo "  3. Test query:  ./query.sh summary"
-if [[ "$SCAN" == "true" ]]; then
-  echo "  4. Deploy linked role: aws cloudformation deploy --template-file linked-account-role.yaml --stack-name cost-guardian-linked-role --parameter-overrides PayerAccountId=$ACCOUNT --capabilities CAPABILITY_NAMED_IAM"
-fi
+echo "  2. Test:  aws lambda invoke --function-name cost-guardian --region $REGION --cli-binary-format raw-in-base64-out --payload '{}' /dev/stdout"
+echo "  3. Query: ./query.sh summary"
+echo "  4. Set up QuickSight Chat Agent: see quicksight-agent-setup.md"

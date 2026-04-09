@@ -1,70 +1,60 @@
 # AWS Cost Guardian
 
-Automated SP/RI monitoring with email alerts and interactive queries. Deploy to the **payer (management) account** for org-wide visibility.
+Automated SP/RI monitoring with email alerts, CLI queries, and an **Amazon Quick custom chat agent** for conversational cost optimization. Deploy to the payer account for org-wide visibility.
 
 ## Features
 
 | Feature | Description |
 |---|---|
-| SP Expiration Alerts | Alerts N days before any Savings Plan expires |
-| RI Expiration Alerts | Scans EC2, RDS, OpenSearch, ElastiCache, Redshift RIs |
+| Email Alerts | Daily HTML email with expiring SPs/RIs, On-Demand spend, recommendations |
 | Cross-Account Scanning | Scans linked accounts for RIs via StackSet role |
-| Missing Coverage | Detects On-Demand spend with no SP/RI and shows recommendations |
-| HTML Email Reports | Styled tables with color-coded badges via SES |
-| Interactive Queries | Query cost data on demand via CLI |
+| CLI Queries | `./query.sh summary` for on-demand data |
+| QuickSight Dashboard | Pre-built visuals for SP/RI coverage and spend trends |
+| **Quick Chat Agent** | Conversational AI — ask "what's expiring?" in natural language |
+| Historical Trends | Daily snapshots in S3 → Athena → trend analysis over time |
 
 ## Architecture
 
 ```
-Payer Account
-├── EventBridge (daily) → Lambda → SES HTML Email
-├── Lambda URL → Interactive queries
-└── AssumeRole → Linked Account 1..N (RI scan)
+Lambda (daily)
+  ├── SES HTML Email → ops/finance team
+  ├── S3 CSV Export → Athena → QuickSight
+  │                              ├── Dashboard (visuals)
+  │                              └── Custom Chat Agent (conversational)
+  ├── Cross-account AssumeRole → linked account RIs
+  └── CLI query interface
 ```
 
 ## Quick Start
 
 ```bash
-# 1. Deploy to payer account
+# 1. Deploy
 ./deploy.sh --email finance@company.com
 
-# 2. Confirm SNS email subscription
+# 2. Confirm SNS email
 
 # 3. Test
 ./query.sh summary
-./query.sh "what's expiring?"
-./query.sh "show recommendations"
-./query.sh "on-demand spend"
+
+# 4. Set up QuickSight Chat Agent
+# See quicksight-agent-setup.md
 ```
 
-## Cross-Account RI Scanning
+## QuickSight Chat Agent
 
-To scan RIs in linked accounts, deploy the role via StackSet:
+After deployment, create a custom chat agent in Amazon Quick that lets your team ask:
 
-```bash
-# Get your payer account ID
-PAYER=$(aws sts get-caller-identity --query Account --output text)
-
-# Deploy to each linked account (or use StackSets)
-aws cloudformation deploy \
-  --template-file linked-account-role.yaml \
-  --stack-name cost-guardian-linked-role \
-  --parameter-overrides PayerAccountId=$PAYER \
-  --capabilities CAPABILITY_NAMED_IAM
 ```
+"Which savings plans expire this month?"
+"Show me On-Demand spend by service"
+"What are the top recommendations?"
+"Which accounts have no RI coverage?"
+"Compare spend trend over the last 30 days"
+```
+
+See [quicksight-agent-setup.md](quicksight-agent-setup.md) for step-by-step instructions.
 
 ## All Parameters
-
-```bash
-./deploy.sh \
-  --email team@company.com \
-  --sender noreply@company.com \
-  --days 60 \
-  --threshold 500 \
-  --region us-west-2 \
-  --schedule "cron(0 14 ? * MON-FRI *)" \
-  --scan-linked true
-```
 
 | Flag | Default | Description |
 |---|---|---|
@@ -75,33 +65,33 @@ aws cloudformation deploy \
 | `--region` | us-east-1 | AWS region |
 | `--schedule` | Daily 9AM UTC | EventBridge cron |
 | `--scan-linked` | true | Scan linked accounts |
-| `--teardown` | | Delete stack |
 
-## Interactive Queries
+## What Gets Deployed
+
+| Resource | Purpose |
+|---|---|
+| Lambda | Core logic — collects data, sends email, writes to S3 |
+| S3 Bucket | Daily CSV snapshots (365-day retention) |
+| Glue Database + Tables | Athena-queryable tables for QuickSight |
+| Athena Workgroup | Query engine |
+| EventBridge Rule | Daily trigger |
+| SNS Topic | Email subscription |
+| IAM Role | Lambda permissions |
+
+## Cross-Account RI Scanning
 
 ```bash
-./query.sh summary              # Overall status
-./query.sh "what's expiring?"   # Expiring SP/RIs
-./query.sh "recommendations"    # Purchase recommendations
-./query.sh "on-demand spend"    # On-Demand breakdown
+PAYER=$(aws sts get-caller-identity --query Account --output text)
+aws cloudformation deploy \
+  --template-file linked-account-role.yaml \
+  --stack-name cost-guardian-linked-role \
+  --parameter-overrides PayerAccountId=$PAYER \
+  --capabilities CAPABILITY_NAMED_IAM
 ```
-
-## Why Payer Account?
-
-- Cost Explorer APIs return org-wide data only from management account
-- Savings Plans are purchased at payer level
-- Cross-account RI scanning requires AssumeRole from payer
-- Single deployment covers entire organization
 
 ## Cost
 
-~$0.01/month (1 Lambda/day + SES email).
-
-## Tear Down
-
-```bash
-./deploy.sh --teardown
-```
+~$0.05/month (Lambda + S3 + Athena + SES).
 
 ## License
 
