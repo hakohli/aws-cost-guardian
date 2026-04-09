@@ -1,10 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: AWS Cost Guardian — SP/RI expiration alerts and missing coverage recommendations
+Description: AWS Cost Guardian — SP/RI expiration alerts and missing coverage recommendations (HTML email via SES)
 
 Parameters:
   AlertEmail:
     Type: String
     Description: Email address for cost alerts
+  SenderEmail:
+    Type: String
+    Description: SES verified sender email
   AlertDays:
     Type: Number
     Default: 30
@@ -55,6 +58,7 @@ Resources:
                   - ce:GetSavingsPlansCoverage
                   - ce:GetReservationCoverage
                   - sns:Publish
+                  - ses:SendEmail
                 Resource: '*'
 
   GuardianFunction:
@@ -71,6 +75,8 @@ Resources:
           SNS_TOPIC_ARN: !Ref AlertTopic
           ALERT_DAYS: !Ref AlertDays
           OD_THRESHOLD: !Ref OnDemandThreshold
+          ALERT_EMAIL: !Ref AlertEmail
+          SENDER_EMAIL: !Ref SenderEmail
       Code:
         ZipFile: |
           import boto3, os, json
@@ -79,226 +85,337 @@ Resources:
           NOW = datetime.now(timezone.utc)
           THRESHOLD = int(os.environ['ALERT_DAYS'])
           OD_THRESHOLD = float(os.environ['OD_THRESHOLD'])
-          TOPIC = os.environ['SNS_TOPIC_ARN']
+          ALERT_EMAIL = os.environ['ALERT_EMAIL']
+          SENDER_EMAIL = os.environ['SENDER_EMAIL']
           ACCOUNT = boto3.client('sts').get_caller_identity()['Account']
+
+          STYLE = """
+          <style>
+            body { font-family: Arial, sans-serif; color: #333; margin: 0; padding: 20px; }
+            .header { background: #232f3e; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 22px; }
+            .header p { margin: 5px 0 0; opacity: 0.8; font-size: 14px; }
+            .content { border: 1px solid #ddd; border-top: none; padding: 20px; border-radius: 0 0 8px 8px; }
+            .section { margin-bottom: 24px; }
+            .section-title { font-size: 16px; font-weight: bold; margin-bottom: 10px; padding: 8px 12px; border-radius: 4px; }
+            .warn { background: #fff3cd; color: #856404; }
+            .danger { background: #f8d7da; color: #721c24; }
+            .info { background: #d1ecf1; color: #0c5460; }
+            .success { background: #d4edda; color: #155724; }
+            table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 14px; }
+            th { background: #f8f9fa; text-align: left; padding: 10px 12px; border: 1px solid #dee2e6; font-weight: 600; }
+            td { padding: 10px 12px; border: 1px solid #dee2e6; }
+            tr:nth-child(even) { background: #f8f9fa; }
+            .amount { text-align: right; font-family: monospace; }
+            .days-critical { color: #dc3545; font-weight: bold; }
+            .days-warning { color: #ffc107; font-weight: bold; }
+            .days-ok { color: #28a745; }
+            .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+            .badge-red { background: #dc3545; color: white; }
+            .badge-yellow { background: #ffc107; color: #333; }
+            .badge-green { background: #28a745; color: white; }
+            .footer { margin-top: 20px; padding-top: 16px; border-top: 1px solid #ddd; font-size: 12px; color: #666; }
+            .summary-box { display: inline-block; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 12px 20px; margin: 4px 8px 4px 0; text-align: center; }
+            .summary-box .number { font-size: 28px; font-weight: bold; color: #232f3e; }
+            .summary-box .label { font-size: 11px; color: #666; text-transform: uppercase; }
+          </style>
+          """
+
+          def days_badge(days):
+              if days <= 7:
+                  return f'<span class="badge badge-red">{days}d</span>'
+              elif days <= 14:
+                  return f'<span class="badge badge-yellow">{days}d</span>'
+              else:
+                  return f'<span class="badge badge-green">{days}d</span>'
 
 
           def check_savings_plans():
-              alerts = []
+              rows = []
               sps = boto3.client('savingsplans').describe_savings_plans(
                   states=['active'])['savingsPlans']
-              if not sps:
-                  return alerts, 0
               for sp in sps:
                   end = datetime.fromisoformat(sp['end'].replace('Z', '+00:00'))
                   days = (end - NOW).days
                   if days <= THRESHOLD:
-                      alerts.append(
-                          f"  • SP {sp['savingsPlanId'][:12]}... "
-                          f"({sp['savingsPlanType']}, ${sp['commitment']}/hr) "
-                          f"— {days} days left (expires {end:%Y-%m-%d})")
-              return alerts, len(sps)
+                      rows.append({
+                          'id': sp['savingsPlanId'][:12] + '...',
+                          'type': sp['savingsPlanType'],
+                          'commitment': f"${sp['commitment']}/hr",
+                          'expires': end.strftime('%Y-%m-%d'),
+                          'days': days
+                      })
+              return rows, len(sps)
 
 
           def check_ris():
-              alerts = []
+              rows = []
               total = 0
 
               # EC2
-              ris = boto3.client('ec2').describe_reserved_instances(
-                  Filters=[{'Name': 'state', 'Values': ['active']}])['ReservedInstances']
-              total += len(ris)
-              for ri in ris:
+              for ri in boto3.client('ec2').describe_reserved_instances(
+                  Filters=[{'Name': 'state', 'Values': ['active']}])['ReservedInstances']:
+                  total += 1
                   end = ri['End'] if ri['End'].tzinfo else ri['End'].replace(tzinfo=timezone.utc)
                   days = (end - NOW).days
                   if days <= THRESHOLD:
-                      alerts.append(
-                          f"  • EC2 RI: {ri['InstanceCount']}x {ri['InstanceType']} "
-                          f"— {days} days left (expires {end:%Y-%m-%d})")
+                      rows.append({
+                          'service': 'EC2',
+                          'detail': f"{ri['InstanceCount']}x {ri['InstanceType']}",
+                          'expires': end.strftime('%Y-%m-%d'),
+                          'days': days
+                      })
 
               # RDS
               for ri in boto3.client('rds').describe_reserved_db_instances()['ReservedDBInstances']:
-                  if ri['State'] != 'active':
-                      continue
+                  if ri['State'] != 'active': continue
                   total += 1
                   start = ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)
                   end = start + timedelta(seconds=ri['Duration'])
                   days = (end - NOW).days
                   if days <= THRESHOLD:
-                      alerts.append(
-                          f"  • RDS RI: {ri['DBInstanceCount']}x {ri['DBInstanceClass']} "
-                          f"— {days} days left (expires {end:%Y-%m-%d})")
+                      rows.append({
+                          'service': 'RDS',
+                          'detail': f"{ri['DBInstanceCount']}x {ri['DBInstanceClass']}",
+                          'expires': end.strftime('%Y-%m-%d'),
+                          'days': days
+                      })
 
               # OpenSearch
               try:
                   for ri in boto3.client('opensearch').describe_reserved_instances()['ReservedInstances']:
-                      if ri['State'] != 'active':
-                          continue
+                      if ri['State'] != 'active': continue
                       total += 1
                       start = ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)
                       end = start + timedelta(seconds=ri['Duration'])
                       days = (end - NOW).days
                       if days <= THRESHOLD:
-                          alerts.append(
-                              f"  • OpenSearch RI: {ri['InstanceCount']}x {ri['InstanceType']} "
-                              f"— {days} days left (expires {end:%Y-%m-%d})")
-              except Exception:
-                  pass
+                          rows.append({
+                              'service': 'OpenSearch',
+                              'detail': f"{ri['InstanceCount']}x {ri['InstanceType']}",
+                              'expires': end.strftime('%Y-%m-%d'),
+                              'days': days
+                          })
+              except Exception: pass
 
               # ElastiCache
               try:
                   for ri in boto3.client('elasticache').describe_reserved_cache_nodes()['ReservedCacheNodes']:
-                      if ri['State'] != 'active':
-                          continue
+                      if ri['State'] != 'active': continue
                       total += 1
                       start = ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)
                       end = start + timedelta(seconds=ri['Duration'])
                       days = (end - NOW).days
                       if days <= THRESHOLD:
-                          alerts.append(
-                              f"  • ElastiCache RI: {ri['CacheNodeCount']}x {ri['CacheNodeType']} "
-                              f"— {days} days left (expires {end:%Y-%m-%d})")
-              except Exception:
-                  pass
+                          rows.append({
+                              'service': 'ElastiCache',
+                              'detail': f"{ri['CacheNodeCount']}x {ri['CacheNodeType']}",
+                              'expires': end.strftime('%Y-%m-%d'),
+                              'days': days
+                          })
+              except Exception: pass
 
               # Redshift
               try:
                   for ri in boto3.client('redshift').describe_reserved_nodes()['ReservedNodes']:
-                      if ri['State'] != 'active':
-                          continue
+                      if ri['State'] != 'active': continue
                       total += 1
                       start = ri['StartTime'] if ri['StartTime'].tzinfo else ri['StartTime'].replace(tzinfo=timezone.utc)
                       end = start + timedelta(seconds=int(ri['Duration']))
                       days = (end - NOW).days
                       if days <= THRESHOLD:
-                          alerts.append(
-                              f"  • Redshift RI: {ri['NodeCount']}x {ri['NodeType']} "
-                              f"— {days} days left (expires {end:%Y-%m-%d})")
-              except Exception:
-                  pass
+                          rows.append({
+                              'service': 'Redshift',
+                              'detail': f"{ri['NodeCount']}x {ri['NodeType']}",
+                              'expires': end.strftime('%Y-%m-%d'),
+                              'days': days
+                          })
+              except Exception: pass
 
-              return alerts, total
+              return rows, total
 
 
           def check_missing_coverage():
-              """Check if there's significant On-Demand spend with no SP/RI coverage."""
               ce = boto3.client('ce')
               end = NOW.strftime('%Y-%m-01')
               start = (NOW.replace(day=1) - timedelta(days=1)).strftime('%Y-%m-01')
-
-              # Get On-Demand spend by service
               resp = ce.get_cost_and_usage(
                   TimePeriod={'Start': start, 'End': end},
                   Granularity='MONTHLY',
                   Metrics=['UnblendedCost'],
                   Filter={'Dimensions': {'Key': 'PURCHASE_TYPE', 'Values': ['On Demand Instances']}},
                   GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}])
-
-              od_services = []
-              total_od = 0
-              for group in resp.get('ResultsByTime', [{}])[0].get('Groups', []):
-                  cost = float(group['Metrics']['UnblendedCost']['Amount'])
+              services = []
+              total = 0
+              for g in resp.get('ResultsByTime', [{}])[0].get('Groups', []):
+                  cost = float(g['Metrics']['UnblendedCost']['Amount'])
                   if cost > 10:
-                      od_services.append((group['Keys'][0], cost))
-                      total_od += cost
-
-              od_services.sort(key=lambda x: -x[1])
-              return od_services, total_od
+                      services.append((g['Keys'][0], cost))
+                      total += cost
+              services.sort(key=lambda x: -x[1])
+              return services, total
 
 
           def get_recommendations():
-              """Pull SP and RI purchase recommendations from Cost Explorer."""
               ce = boto3.client('ce')
               recs = []
-
-              # SP recommendations
               try:
                   resp = ce.get_savings_plans_purchase_recommendation(
                       SavingsPlansType='COMPUTE_SP',
                       LookbackPeriodInDays='THIRTY_DAYS',
                       PaymentOption='NO_UPFRONT',
                       TermInYears='ONE_YEAR')
-                  sp_rec = resp.get('SavingsPlansPurchaseRecommendation', {})
-                  summary = sp_rec.get('SavingsPlansPurchaseRecommendationSummary', {})
-                  if summary.get('EstimatedMonthlySavingsAmount'):
-                      savings = float(summary['EstimatedMonthlySavingsAmount'])
-                      commitment = summary.get('HourlyCommitmentToPurchase', '?')
-                      if savings > 0:
-                          recs.append(
-                              f"  • Compute SP (1yr No Upfront): ${commitment}/hr commitment "
-                              f"→ saves ~${savings:,.0f}/mo")
-              except Exception:
-                  pass
+                  summary = resp.get('SavingsPlansPurchaseRecommendation', {}).get(
+                      'SavingsPlansPurchaseRecommendationSummary', {})
+                  savings = float(summary.get('EstimatedMonthlySavingsAmount', 0))
+                  if savings > 0:
+                      recs.append({
+                          'type': 'Compute Savings Plan',
+                          'term': '1yr No Upfront',
+                          'commitment': f"${summary.get('HourlyCommitmentToPurchase', '?')}/hr",
+                          'savings': savings
+                      })
+              except Exception: pass
 
-              # EC2 RI recommendations
-              for svc in ['Amazon Elastic Compute Cloud - Compute',
-                          'Amazon Relational Database Service',
-                          'Amazon OpenSearch Service']:
+              for svc, label in [
+                  ('Amazon Elastic Compute Cloud - Compute', 'EC2'),
+                  ('Amazon Relational Database Service', 'RDS'),
+                  ('Amazon OpenSearch Service', 'OpenSearch')]:
                   try:
                       resp = ce.get_reservation_purchase_recommendation(
-                          Service=svc,
-                          LookbackPeriodInDays='THIRTY_DAYS',
-                          PaymentOption='NO_UPFRONT',
-                          TermInYears='ONE_YEAR')
+                          Service=svc, LookbackPeriodInDays='THIRTY_DAYS',
+                          PaymentOption='NO_UPFRONT', TermInYears='ONE_YEAR')
                       for rec in resp.get('Recommendations', []):
-                          for detail in rec.get('RecommendationDetails', [])[:3]:
-                              savings = float(detail.get('EstimatedMonthlySavingsAmount', 0))
-                              if savings > 10:
-                                  instance = detail.get('InstanceDetails', {})
-                                  desc = json.dumps(instance)[:80] if instance else 'N/A'
-                                  recs.append(f"  • {svc.split('-')[0].strip()} RI: {desc} → saves ~${savings:,.0f}/mo")
-                  except Exception:
-                      pass
-
+                          for d in rec.get('RecommendationDetails', [])[:3]:
+                              s = float(d.get('EstimatedMonthlySavingsAmount', 0))
+                              if s > 10:
+                                  recs.append({
+                                      'type': f'{label} Reserved Instance',
+                                      'term': '1yr No Upfront',
+                                      'commitment': json.dumps(d.get('InstanceDetails', {}))[:60],
+                                      'savings': s
+                                  })
+                  except Exception: pass
               return recs
 
 
+          def build_html(sp_rows, sp_count, ri_rows, ri_count, od_services, od_total, recs):
+              html = f"""<html><head>{STYLE}</head><body>
+              <div class="header">
+                <h1>AWS Cost Guardian</h1>
+                <p>Account: {ACCOUNT} &nbsp;|&nbsp; {NOW:%B %d, %Y}</p>
+              </div>
+              <div class="content">
+
+              <div style="margin-bottom:20px">
+                <div class="summary-box">
+                  <div class="number">{len(sp_rows) + len(ri_rows)}</div>
+                  <div class="label">Expiring SP/RI</div>
+                </div>
+                <div class="summary-box">
+                  <div class="number">{sp_count + ri_count}</div>
+                  <div class="label">Active SP/RI</div>
+                </div>
+                <div class="summary-box">
+                  <div class="number">${od_total:,.0f}</div>
+                  <div class="label">On-Demand/mo</div>
+                </div>
+                <div class="summary-box">
+                  <div class="number">${sum(r['savings'] for r in recs):,.0f}</div>
+                  <div class="label">Potential Savings/mo</div>
+                </div>
+              </div>"""
+
+              # Expiring SPs
+              if sp_rows:
+                  html += """<div class="section">
+                    <div class="section-title warn">&#9888;&#65039; Savings Plans Expiring</div>
+                    <table><tr><th>Plan ID</th><th>Type</th><th>Commitment</th><th>Expires</th><th>Days Left</th></tr>"""
+                  for r in sp_rows:
+                      html += f"<tr><td>{r['id']}</td><td>{r['type']}</td><td class='amount'>{r['commitment']}</td><td>{r['expires']}</td><td>{days_badge(r['days'])}</td></tr>"
+                  html += "</table></div>"
+
+              # Expiring RIs
+              if ri_rows:
+                  html += """<div class="section">
+                    <div class="section-title warn">&#9888;&#65039; Reserved Instances Expiring</div>
+                    <table><tr><th>Service</th><th>Instance Details</th><th>Expires</th><th>Days Left</th></tr>"""
+                  for r in ri_rows:
+                      html += f"<tr><td>{r['service']}</td><td>{r['detail']}</td><td>{r['expires']}</td><td>{days_badge(r['days'])}</td></tr>"
+                  html += "</table></div>"
+
+              # Missing coverage
+              if od_total > OD_THRESHOLD:
+                  status = '&#10060; No active Savings Plans or Reserved Instances' if sp_count == 0 and ri_count == 0 else ''
+                  html += f"""<div class="section">
+                    <div class="section-title danger">&#128176; On-Demand Spend Without SP/RI Coverage: ${od_total:,.0f}/mo</div>
+                    {f'<p style="color:#dc3545;font-weight:bold">{status}</p>' if status else ''}
+                    <table><tr><th>Service</th><th style="text-align:right">Monthly On-Demand</th><th style="text-align:right">% of Total</th></tr>"""
+                  for svc, cost in od_services[:10]:
+                      pct = (cost / od_total * 100) if od_total > 0 else 0
+                      bar_width = int(pct * 2)
+                      html += f"""<tr><td>{svc}</td>
+                        <td class="amount">${cost:,.0f}</td>
+                        <td class="amount">{pct:.1f}% <span style="display:inline-block;background:#dc3545;height:10px;width:{bar_width}px;border-radius:2px"></span></td></tr>"""
+                  html += "</table></div>"
+
+              # Recommendations
+              if recs:
+                  html += """<div class="section">
+                    <div class="section-title info">&#128203; Purchase Recommendations</div>
+                    <table><tr><th>Type</th><th>Term</th><th>Commitment</th><th style="text-align:right">Est. Monthly Savings</th></tr>"""
+                  for r in recs:
+                      html += f"<tr><td>{r['type']}</td><td>{r['term']}</td><td>{r['commitment']}</td><td class='amount' style='color:#28a745;font-weight:bold'>${r['savings']:,.0f}</td></tr>"
+                  html += "</table></div>"
+
+              # No issues
+              if not sp_rows and not ri_rows and od_total <= OD_THRESHOLD:
+                  html += '<div class="section"><div class="section-title success">&#9989; All Clear — No expiring commitments, coverage looks good.</div></div>'
+
+              html += f"""
+              <div class="footer">
+                <p>&#128279; <a href="https://us-east-1.console.aws.amazon.com/cost-management/home#/savings-plans/recommendations">View SP Recommendations</a>
+                &nbsp;|&nbsp; <a href="https://us-east-1.console.aws.amazon.com/cost-management/home#/reservations/recommendations">View RI Recommendations</a></p>
+                <p>Generated by <strong>AWS Cost Guardian</strong> &nbsp;|&nbsp; Runs daily at 9:00 AM UTC</p>
+              </div>
+              </div></body></html>"""
+              return html
+
+
           def handler(event, context):
-              sections = []
-              needs_alert = False
+              sp_rows, sp_count = check_savings_plans()
+              ri_rows, ri_count = check_ris()
+              od_services, od_total = check_missing_coverage()
+              recs = []
 
-              # 1. Expiring SPs
-              sp_alerts, sp_count = check_savings_plans()
-              if sp_alerts:
-                  sections.append("⚠️ SAVINGS PLANS EXPIRING\n" + "\n".join(sp_alerts))
-                  needs_alert = True
+              needs_alert = bool(sp_rows) or bool(ri_rows) or od_total > OD_THRESHOLD
 
-              # 2. Expiring RIs
-              ri_alerts, ri_count = check_ris()
-              if ri_alerts:
-                  sections.append("⚠️ RESERVED INSTANCES EXPIRING\n" + "\n".join(ri_alerts))
-                  needs_alert = True
-
-              # 3. Missing coverage
-              od_services, total_od = check_missing_coverage()
-              if total_od > OD_THRESHOLD:
-                  lines = [f"  • {svc}: ${cost:,.0f}/mo On-Demand" for svc, cost in od_services[:10]]
-                  header = f"💰 ON-DEMAND SPEND WITHOUT SP/RI COVERAGE: ${total_od:,.0f}/mo"
-                  if sp_count == 0 and ri_count == 0:
-                      header += "\n  ❌ You have NO active Savings Plans or Reserved Instances"
-                  sections.append(header + "\n" + "\n".join(lines))
-                  needs_alert = True
-
-                  # 4. Recommendations
+              if od_total > OD_THRESHOLD:
                   recs = get_recommendations()
-                  if recs:
-                      sections.append("📋 PURCHASE RECOMMENDATIONS\n" + "\n".join(recs))
 
               if needs_alert:
-                  subject = f"[{ACCOUNT}] Cost Guardian Alert"
-                  body = f"AWS Cost Guardian — {NOW:%Y-%m-%d}\nAccount: {ACCOUNT}\n\n"
-                  body += "\n\n".join(sections)
-                  body += "\n\n---\nAction: Review recommendations in AWS Cost Explorer → Savings Plans / Reservations."
-                  boto3.client('sns').publish(
-                      TopicArn=TOPIC, Subject=subject, Message=body)
-                  print(f"Alert sent: {len(sections)} sections")
+                  html = build_html(sp_rows, sp_count, ri_rows, ri_count, od_services, od_total, recs)
+                  subject = f"[{ACCOUNT}] Cost Guardian"
+                  if sp_rows or ri_rows:
+                      subject += f" — {len(sp_rows) + len(ri_rows)} SP/RI Expiring"
+                  if od_total > OD_THRESHOLD and sp_count == 0 and ri_count == 0:
+                      subject += f" — ${od_total:,.0f}/mo On-Demand (No SP/RI)"
+
+                  boto3.client('ses', region_name='us-east-1').send_email(
+                      Source=SENDER_EMAIL,
+                      Destination={'ToAddresses': [ALERT_EMAIL]},
+                      Message={
+                          'Subject': {'Data': subject},
+                          'Body': {'Html': {'Data': html}}
+                      })
+                  print(f"HTML alert sent to {ALERT_EMAIL}")
               else:
-                  print("All clear — no expiring SPs/RIs, coverage looks good")
+                  print("All clear — no alerts needed")
 
               return {
-                  'expiring_sps': len(sp_alerts),
-                  'expiring_ris': len(ri_alerts),
-                  'on_demand_total': total_od,
+                  'expiring_sps': len(sp_rows),
+                  'expiring_ris': len(ri_rows),
+                  'on_demand_total': od_total,
                   'alerted': needs_alert
               }
 
@@ -328,6 +445,3 @@ Outputs:
   FunctionArn:
     Description: Lambda function ARN
     Value: !GetAtt GuardianFunction.Arn
-  DashboardUrl:
-    Description: Cost Explorer link
-    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cost-management/home#/savings-plans/recommendations'
