@@ -22,6 +22,11 @@ Metadata:
         Parameters:
           - ScheduleExpression
           - ScanLinkedAccounts
+      - Label:
+          default: "💬 Slack / Teams (Optional)"
+        Parameters:
+          - SlackWebhookUrl
+          - TeamsWebhookUrl
     ParameterLabels:
       AlertEmail:
         default: "Alert Email — Who should receive cost alerts?"
@@ -35,6 +40,10 @@ Metadata:
         default: "Schedule — When should the check run? (UTC cron expression)"
       ScanLinkedAccounts:
         default: "Scan Linked Accounts — Check RIs in linked accounts via cross-account role?"
+      SlackWebhookUrl:
+        default: "Slack Webhook — Incoming webhook URL for Slack notifications"
+      TeamsWebhookUrl:
+        default: "Teams Webhook — Incoming webhook URL for Teams notifications"
 
 Parameters:
   AlertEmail:
@@ -67,6 +76,16 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: "Enable cross-account RI scanning. Requires cost-guardian-linked-role deployed to linked accounts via StackSet."
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: "(Optional) Slack incoming webhook URL for channel notifications"
+    NoEcho: true
+  TeamsWebhookUrl:
+    Type: String
+    Default: ''
+    Description: "(Optional) Microsoft Teams incoming webhook URL for channel notifications"
+    NoEcho: true
 
 Resources:
 
@@ -159,6 +178,8 @@ Resources:
           DEPLOY_REGION: !Ref AWS::Region
           SCAN_LINKED: !Ref ScanLinkedAccounts
           DATA_BUCKET: !Ref DataBucket
+          SLACK_WEBHOOK: !Ref SlackWebhookUrl
+          TEAMS_WEBHOOK: !Ref TeamsWebhookUrl
       Code:
         ZipFile: |
           def handler(event, context):

@@ -22,6 +22,7 @@ EOF
 
 EMAIL="" SENDER="" DAYS=30 THRESHOLD=100 REGION="us-east-1"
 SCHEDULE="cron(0 9 * * ? *)" SCAN="true" TEARDOWN=false
+SLACK="" TEAMS=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -32,6 +33,8 @@ while [[ $# -gt 0 ]]; do
     --region) REGION="$2"; shift 2;;
     --schedule) SCHEDULE="$2"; shift 2;;
     --scan-linked) SCAN="$2"; shift 2;;
+    --slack) SLACK="$2"; shift 2;;
+    --teams) TEAMS="$2"; shift 2;;
     --teardown) TEARDOWN=true; shift;;
     *) echo "Unknown: $1"; usage;;
   esac
@@ -79,6 +82,8 @@ aws cloudformation deploy \
     OnDemandThreshold="$THRESHOLD" \
     ScheduleExpression="$SCHEDULE" \
     ScanLinkedAccounts="$SCAN" \
+    SlackWebhookUrl="$SLACK" \
+    TeamsWebhookUrl="$TEAMS" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION"
 
