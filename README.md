@@ -81,6 +81,66 @@ Lambda (daily)
 
 Or deploy via AWS Console: CloudFormation → Create Stack → Upload `template.yaml` → fill in parameters.
 
+## Slack / Teams Integration
+
+Alerts can be sent to Slack and/or Microsoft Teams channels alongside email — so nothing gets lost in an inbox.
+
+### Slack Setup
+1. Create an [Incoming Webhook](https://api.slack.com/messaging/webhooks) in your Slack workspace
+2. Choose the channel (e.g., `#cost-alerts`)
+3. Copy the webhook URL
+4. Deploy with `--slack`:
+
+```bash
+./deploy.sh --email team@company.com \
+  --slack https://hooks.slack.com/services/T.../B.../xxxxx
+```
+
+**Slack message includes:**
+- Summary boxes (expiring count, active SP/RI, On-Demand total, potential savings)
+- Expiring commitments with days remaining
+- Granular recommendations: "In Account Prod, buy 10x m5.4xlarge → saves $1,511/mo"
+- Top On-Demand services
+- Direct links to Cost Explorer
+
+### Microsoft Teams Setup
+1. In your Teams channel, add an [Incoming Webhook connector](https://learn.microsoft.com/en-us/microsoftteams/platform/webhooks-and-connectors/how-to/add-incoming-webhook)
+2. Copy the webhook URL
+3. Deploy with `--teams`:
+
+```bash
+./deploy.sh --email team@company.com \
+  --teams https://outlook.office.com/webhook/xxxxx
+```
+
+### Both Channels
+```bash
+./deploy.sh --email team@company.com \
+  --slack https://hooks.slack.com/services/... \
+  --teams https://outlook.office.com/webhook/...
+```
+
+All three channels (email, Slack, Teams) fire in parallel on every alert.
+
+## Granular Recommendations
+
+Cost Guardian doesn't just say "buy RIs to save money." It tells you exactly **which account**, **which instance type**, **how many**, and **how much you'll save**:
+
+```
+📋 Recommendations — Granular Breakdown
+┌──────────────┬──────────────────────────┬─────────┬──────────────┬────────────┐
+│ Account      │ Action                   │ Type    │ Term         │ Savings/mo │
+├──────────────┼──────────────────────────┼─────────┼──────────────┼────────────┤
+│ Prod         │ Buy 10x m5.4xlarge       │ EC2 RI  │ 1yr No Up.   │ $1,511     │
+│ Prod         │ Buy 62x m5.large         │ EC2 RI  │ 1yr No Up.   │ $1,476     │
+│ SharedSvcs   │ Buy 1x db.m6i.2xlarge    │ RDS RI  │ 1yr No Up.   │ $589       │
+│ Test         │ Buy 4x db.t3.xlarge      │ RDS RI  │ 1yr No Up.   │ $489       │
+│ Org-wide     │ $5.50/hr commitment      │ Comp SP │ 1yr No Up.   │ $3,200     │
+└──────────────┴──────────────────────────┴─────────┴──────────────┴────────────┘
+```
+
+This data is sourced from Cost Explorer's per-account RI and SP recommendation APIs, covering EC2, RDS, OpenSearch, ElastiCache, and Redshift.
+
 ## CloudFormation Parameters
 
 | Parameter | Default | Description |
@@ -91,6 +151,8 @@ Or deploy via AWS Console: CloudFormation → Create Stack → Upload `template.
 | On-Demand Threshold | $100/mo | Alert when On-Demand spend exceeds this with no coverage |
 | Schedule | Daily 9AM UTC | When the check runs (cron expression) |
 | Scan Linked Accounts | true | Enable cross-account RI scanning |
+| Slack Webhook | (optional) | Slack incoming webhook URL for channel alerts |
+| Teams Webhook | (optional) | Microsoft Teams incoming webhook URL for channel alerts |
 
 ## QuickSight Chat Agent
 

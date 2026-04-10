@@ -215,7 +215,8 @@ def write_to_s3(data):
     # Recommendations CSV
     if data['recommendations']:
         buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=['snapshot_date','type','term','commitment','estimated_monthly_savings'])
+        w = csv.DictWriter(buf, fieldnames=['snapshot_date','account','account_name','type','term','commitment','instance_detail','estimated_monthly_savings'],
+            extrasaction='ignore')
         w.writeheader()
         for r in data['recommendations']:
             r['snapshot_date'] = date_str
@@ -307,10 +308,12 @@ def build_html(data):
         html += '</table></div>'
 
     if recs:
-        html += '<div class="section"><div class="stitle info">&#128203; Recommendations</div>'
-        html += '<table><tr><th>Type</th><th>Term</th><th>Commitment</th><th style="text-align:right">Savings/mo</th></tr>'
+        html += '<div class="section"><div class="stitle info">&#128203; Recommendations — Granular Breakdown</div>'
+        html += '<table><tr><th>Account</th><th>Action</th><th>Type</th><th>Term</th><th style="text-align:right">Est. Savings/mo</th></tr>'
         for r in recs:
-            html += f"<tr><td>{r['type']}</td><td>{r['term']}</td><td>{r['commitment']}</td><td class='amt' style='color:#28a745;font-weight:700'>${r['estimated_monthly_savings']:,.0f}</td></tr>"
+            acct_display = r.get('account_name', r.get('account', 'Org-wide'))
+            action = f"Buy {r.get('instance_detail', r.get('commitment', ''))}"
+            html += f"<tr><td>{acct_display}</td><td><strong>{action}</strong></td><td>{r['type']}</td><td>{r['term']}</td><td class='amt' style='color:#28a745;font-weight:700'>${r['estimated_monthly_savings']:,.0f}</td></tr>"
         html += '</table></div>'
 
     if not exp and od_total <= OD_THRESHOLD:
